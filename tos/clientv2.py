@@ -26,9 +26,10 @@ from . import exceptions, utils
 from .auth import AnonymousAuth, CredentialProviderAuth
 from .checkpoint import (CheckPointStore, _BreakpointDownloader,
                          _BreakpointUploader, _BreakpointResumableCopyObject)
+from .safe_map import SafeMapFIFO
 from .client import _make_virtual_host_url, _make_virtual_host_uri, _get_virtual_host, _get_host, _get_scheme
 from .consts import (GMT_DATE_FORMAT, SLEEP_BASE_TIME, UNSIGNED_PAYLOAD,
-                     WHITE_LIST_FUNCTION, CALLBACK_FUNCTION)
+                     WHITE_LIST_FUNCTION, CALLBACK_FUNCTION, BUCKET_TYPE_FNS, BUCKET_TYPE_HNS)
 from .credential import StaticCredentialsProvider
 from .enum import (ACLType, AzRedundancyType, DataTransferType, HttpMethodType,
                    MetadataDirectiveType, StorageClassType, UploadEventType, VersioningStatusType, CopyEventType)
@@ -72,7 +73,7 @@ from .models2 import (AbortMultipartUpload, AppendObjectOutput,
                       DeleteBucketTaggingOutput, GetBucketTaggingOutput, PutSymlinkOutput, GetSymlinkOutput,
                       GenericInput, GetFetchTaskOutput, BucketEncryptionRule, GetBucketEncryptionOutput,
                       DeleteBucketEncryptionOutput, PutBucketEncryptionOutput, PutBucketNotificationType2Output,
-                      GetBucketNotificationType2Output)
+                      GetBucketNotificationType2Output, FileStatusOutput, ModifyObjectOutput)
 from .thread_ctx import consume_body
 from .utils import (SizeAdapter, _make_copy_source,
                     _make_range_string, _make_upload_part_file_content,
@@ -93,7 +94,7 @@ BASE_RETRY_DELAY_TIME = 500
 
 
 def _get_create_bucket_headers(ACL: ACLType, AzRedundancy: AzRedundancyType, GrantFullControl, GrantRead, GrantReadACP,
-                               GrantWrite, GrantWriteACP, StorageClass: StorageClassType, ProjectName):
+                               GrantWrite, GrantWriteACP, StorageClass: StorageClassType, ProjectName, BucketType):
     headers = {}
     if ACL:
         headers['x-tos-acl'] = ACL.value
@@ -113,6 +114,8 @@ def _get_create_bucket_headers(ACL: ACLType, AzRedundancy: AzRedundancyType, Gra
         headers['x-tos-az-redundancy'] = AzRedundancy.value
     if ProjectName:
         headers['x-tos-project-name'] = ProjectName
+    if BucketType:
+        headers['x-tos-bucket-type'] = BucketType
     return headers
 
 
@@ -406,7 +409,6 @@ def _get_put_object_headers(recognize_content_type, ACL, CacheControl, ContentDi
         headers['x-tos-if-match'] = IfMatch
     return headers
 
-
 def _get_object_headers(IfMatch, IfModifiedSince, IfNoneMatch, IfUnmodifiedSince, Range, SSECustomerAlgorithm,
                         SSECustomerKey, SSECustomerKeyMD5, TrafficLimit):
     headers = {}
@@ -459,6 +461,59 @@ def _get_object_params(ResponseCacheControl, ResponseContentDisposition, Respons
     if SaveAsObject:
         params["x-tos-save-object"] = SaveAsObject
     return params
+
+
+def _get_modify_object_headers_params(recognize_content_type, acl, cache_control, content_disposition,
+                                      content_encoding, content_language, content_length, content_type, expires,
+                                      grant_full_control, grant_read, grant_read_ACP, grant_write_ACP, key, metadata,
+                                      storage_class, website_redirect_location, traffic_limit, if_match,
+                                      disable_encoding_meta):
+    headers = {}
+    if metadata:
+        for k in metadata:
+            headers['x-tos-meta-' + k] = metadata[k]
+        if not disable_encoding_meta:
+            headers = meta_header_encode(headers)
+
+    if acl:
+        headers['x-tos-acl'] = acl.value
+    if grant_full_control:
+        headers['x-tos-grant-full-control'] = grant_full_control
+    if grant_read:
+        headers['x-tos-grant-read'] = grant_read
+    if grant_read_ACP:
+        headers['x-tos-grant-read-acp'] = grant_read_ACP
+    if grant_write_ACP:
+        headers['x-tos-grant-write-acp'] = grant_write_ACP
+    if cache_control:
+        headers['cache-control'] = cache_control
+
+    if content_disposition:
+        headers['content-disposition'] = content_disposition if disable_encoding_meta else content_disposition_encode(
+            content_disposition)
+
+    if content_encoding:
+        headers['content-encoding'] = content_encoding
+    if content_language:
+        headers["content-language"] = content_language
+    if content_type:
+        headers["content-type"] = content_type
+
+    elif recognize_content_type:
+        headers['content-type'] = get_content_type(key)
+    if expires:
+        headers["expires"] = expires.strftime(GMT_DATE_FORMAT)
+    if website_redirect_location:
+        headers['x-tos-website-redirect-location'] = website_redirect_location
+    if storage_class:
+        headers['x-tos-storage-class'] = storage_class.value
+    if if_match:
+        headers['x-tos-if-match'] = if_match
+    if traffic_limit:
+        headers['x-tos-traffic-limit'] = str(traffic_limit)
+    if content_length:
+        headers['Content-Length'] = str(content_length)
+    return headers
 
 
 def _get_append_object_headers_params(recognize_content_type, ACL, CacheControl, ContentDisposition,
@@ -909,6 +964,8 @@ class TosClientV2(TosClient):
         if self.dns_cache_time is not None and self.dns_cache_time > 0:
             self._start_async_refresh_cache = self._open_dns_cache()
 
+        self.bucket_type_cache = SafeMapFIFO(max_length=100, default_expiration_sec=60)
+
     def close(self):
         """关闭Client
 
@@ -1016,6 +1073,7 @@ class TosClientV2(TosClient):
                       storage_class: StorageClassType = None,
                       az_redundancy: AzRedundancyType = None,
                       project_name: str = None,
+                      bucket_type: str = BUCKET_TYPE_FNS,
                       generic_input: GenericInput = None) -> CreateBucketOutput:
         """创建bucket
 
@@ -1046,12 +1104,52 @@ class TosClientV2(TosClient):
         headers = _get_create_bucket_headers(acl, az_redundancy,
                                              grant_full_control,
                                              grant_read, grant_read_acp, grant_write,
-                                             grant_write_acp, storage_class, project_name)
+                                             grant_write_acp, storage_class, project_name, bucket_type)
 
         resp = self._req(bucket=bucket, method=HttpMethodType.Http_Method_Put.value, headers=headers,
                          generic_input=generic_input)
 
         return CreateBucketOutput(resp)
+
+    def get_file_status(self, bucket: str, key: str, project_name: str = None, generic_input: GenericInput = None):
+        """查询文件状态
+
+        此接口用于查询HNS桶的文件状态
+        如果桶不存在或者没有访问桶的权限，此接口会返回404 Not Found或403 Forbidden状态码的TosServerError。
+
+        :param bucket: 桶名
+        :param key: 文件名
+        :param project_name: 桶所属项目名
+        :param generic_input: 通用请求参数，比如request_date设置签名UTC时间，代表本次请求Header中指定的 X-Tos-Date 头域
+        :return: FileStatusOutput
+        """
+
+        _is_valid_bucket_name(bucket)
+        headers = {}
+        if project_name:
+            headers['x-tos-project-name'] = project_name
+
+        bucket_type = self._get_bucket_type(bucket)
+        if bucket_type == BUCKET_TYPE_HNS:
+            # head
+            resp = self._req(bucket=bucket, key=key, method=HttpMethodType.Http_Method_Head.value,
+                             headers=headers,
+                             generic_input=generic_input)
+            return FileStatusOutput(key, bucket_type, resp)
+        headers = {}
+        query = {"stat": ""}
+        resp = self._req(bucket=bucket, key=key, method=HttpMethodType.Http_Method_Get.value, headers=headers,
+                         params=query, generic_input=generic_input)
+
+        return FileStatusOutput(key, bucket_type, resp)
+
+    def _get_bucket_type(self, bucket: str = None):
+        bucket_type = self.bucket_type_cache.get(bucket)
+        if bucket_type is None:
+            rsp = self.head_bucket(bucket=bucket)
+            bucket_type = rsp.bucket_type
+            self.bucket_type_cache.put(key=bucket, value=bucket_type)
+        return bucket_type
 
     def head_bucket(self, bucket: str, project_name: str = None,
                     generic_input: GenericInput = None) -> HeadBucketOutput:
@@ -1616,6 +1714,73 @@ class TosClientV2(TosClient):
                                    data_transfer_listener, rate_limiter, traffic_limit, f, callback, callback_var,
                                    forbid_overwrite, if_match, generic_input)
 
+    def _modify_object(self, bucket: str, key: str, offset: int,
+                       content=None,
+                       content_length: int = None,
+                       cache_control: str = None,
+                       content_disposition: str = None,
+                       content_encoding: str = None,
+                       content_language: str = None,
+                       content_type: str = None,
+                       expires: datetime = None,
+                       acl: ACLType = None,
+                       grant_full_control: str = None,
+                       grant_read: str = None,
+                       grant_read_acp: str = None,
+                       grant_write_acp: str = None,
+                       meta: Dict = None,
+                       website_redirect_location: str = None,
+                       storage_class: StorageClassType = None,
+                       data_transfer_listener=None,
+                       rate_limiter=None,
+                       pre_hash_crc64_ecma: int = None,
+                       traffic_limit: int = None,
+                       if_match: str = None,
+                       generic_input: GenericInput = None):
+
+        check_enum_type(acl=acl, storage_class=storage_class)
+        _is_valid_object_name(key)
+
+        params = {"modify": ""}
+        if offset is not None:
+            params['offset'] = offset
+        headers = _get_modify_object_headers_params(self.recognize_content_type, acl, cache_control,
+                                                    content_disposition,
+                                                    content_encoding,
+                                                    content_language, content_length, content_type,
+                                                    expires, grant_full_control, grant_read, grant_read_acp,
+                                                    grant_write_acp, key, meta, storage_class,
+                                                    website_redirect_location, traffic_limit, if_match,
+                                                    self.disable_encoding_meta)
+
+        if self.except100_continue_threshold > 0 and (
+                content_length is None or content_length > self.except100_continue_threshold):
+            headers['Expect'] = "100-continue"
+        if content:
+            content = init_content(content)
+            patch_content(content)
+            if isinstance(content, _ReaderAdapter) and content.size == 0:
+                raise TosClientError('Your proposed append content is smaller than the minimum allowed size')
+
+            if data_transfer_listener:
+                content = utils.add_progress_listener_func(content, data_transfer_listener)
+
+            if rate_limiter:
+                content = utils.add_rate_limiter_func(content, rate_limiter)
+
+            if content and self.enable_crc and pre_hash_crc64_ecma is not None:
+                content = utils.add_crc_func(content, init_crc=pre_hash_crc64_ecma)
+
+        resp = self._req(bucket=bucket, key=key, method=HttpMethodType.Http_Method_Post.value, data=content,
+                         headers=headers, params=params, generic_input=generic_input)
+
+        result = ModifyObjectOutput(resp)
+
+        if self.enable_crc and result.hash_crc64_ecma is not None and pre_hash_crc64_ecma is not None:
+            utils.check_crc('append object', content.crc, result.hash_crc64_ecma, resp.request_id)
+
+        return result
+
     @high_latency_log
     def append_object(self, bucket: str, key: str, offset: int,
                       content=None,
@@ -1675,6 +1840,19 @@ class TosClientV2(TosClient):
         _is_valid_object_name(key)
 
         params = {'append': '', 'offset': offset}
+
+        bucket_type = self._get_bucket_type(bucket)
+        if bucket_type == BUCKET_TYPE_HNS:
+            return self._modify_object(bucket=bucket, key=key, offset=offset, content=content,
+                                       content_length=content_length, cache_control=cache_control,
+                                       content_disposition=content_disposition, content_encoding=content_encoding,
+                                       content_language=content_language, content_type=content_type, expires=expires,
+                                       acl=acl, grant_full_control=grant_full_control, grant_read=grant_read,
+                                       grant_read_acp=grant_read_acp, grant_write_acp=grant_write_acp, meta=meta,
+                                       website_redirect_location=website_redirect_location, storage_class=storage_class,
+                                       data_transfer_listener=data_transfer_listener, rate_limiter=rate_limiter,
+                                       pre_hash_crc64_ecma=pre_hash_crc64_ecma, traffic_limit=traffic_limit,
+                                       if_match=if_match, generic_input=generic_input)
 
         headers = _get_append_object_headers_params(self.recognize_content_type, acl, cache_control,
                                                     content_disposition,

@@ -6,12 +6,14 @@ import time
 import time as tim
 import unittest
 
+import crcmod
 from pytz import UTC
 
 import tos
 from tests.common import TosTestBase, clean_and_delete_bucket
 from tos import TosClientV2
 from tos.checkpoint import TaskExecutor
+from tos.consts import BUCKET_TYPE_HNS
 from tos.credential import EnvCredentialsProvider
 from tos.enum import ACLType, StorageClassType, RedirectType, StatusType, PermissionType, CannedType, GranteeType, \
     VersioningStatusType, ProtocolType, AzRedundancyType, StorageClassInheritDirectiveType, CertStatus
@@ -34,6 +36,53 @@ class TestBucket(TosTestBase):
 
     def test_ua(self):
         assert 'v' in tos.clientv2.USER_AGENT
+
+    def test_hns_bucket(self):
+        bucket_name = self.bucket_name + "hcl"
+        self.bucket_delete.append(bucket_name)
+        # bucket_name = "sun-eafrofzkzphcl"
+        rsp = self.client.create_bucket(bucket_name, bucket_type="hns")
+        print(rsp)
+        assert rsp.status_code == 200
+        rsp = self.client.head_bucket(bucket=bucket_name)
+        assert rsp.status_code == 200
+        assert rsp.bucket_type == BUCKET_TYPE_HNS
+        key = "hns/test/1.txt"
+        rsp = self.client.put_object(bucket=bucket_name, key=key, content="hello")
+        assert rsp.status_code == 200
+        rsp = self.client.get_file_status(bucket=bucket_name, key=key)
+        assert rsp.status_code == 200
+        append_key = "hns/test/2.txt"
+        rsp = self.client.put_object(bucket=bucket_name, key=append_key)
+        assert rsp.status_code == 200
+        rsp = self.client.append_object(bucket=bucket_name, key=append_key, offset=0, content="hello1",)
+        offset = rsp.next_modify_offset
+        assert rsp.status_code == 200
+        assert offset == 6
+        rsp = self.client.append_object(bucket=bucket_name, key=append_key, offset=offset, content="hello2")
+        offset = rsp.next_modify_offset
+        assert rsp.status_code == 200
+        assert offset == 12
+        rsp = self.client.get_object(bucket=bucket_name, key=append_key)
+        data = rsp.read().decode('utf-8')
+        assert data == 'hello1hello2'
+
+
+    def test_get_file_status(self):
+        bucket_name = self.bucket_name + "basic"
+        self.bucket_delete.append(bucket_name)
+        out = self.client.create_bucket(bucket_name)
+        assert out.status_code == 200
+        key = "hns/test/1.txt"
+        content = "hello"
+        rsp = self.client.put_object(bucket=bucket_name, key=key, content=content)
+        assert rsp.status_code == 200
+        rsp = self.client.get_file_status(bucket=bucket_name, key=key)
+        assert rsp.status_code == 200
+        assert rsp.key == key
+        do_crc64 = crcmod.mkCrcFun(0x142F0E1EBA9EA3693, initCrc=0, xorOut=0xffffffffffffffff, rev=True)
+        c1 = do_crc64(content.encode())
+        assert rsp.crc64 == str(c1)
 
     def test_bucket(self):
         bucket_name = self.bucket_name + "basic"

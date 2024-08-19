@@ -1,3 +1,4 @@
+import json
 import urllib.parse
 from datetime import datetime
 from typing import List
@@ -8,7 +9,7 @@ from .enum import CannedType, GranteeType, PermissionType, StorageClassType, Red
     convert_storage_class_type, convert_az_redundancy_type, convert_permission_type, convert_grantee_type, \
     convert_canned_type, convert_redirect_type, convert_status_type, convert_versioning_status_type, \
     convert_protocol_type, convert_cert_status, TierType, convert_tier_type, ACLType, convert_replication_status_type
-from .consts import CHUNK_SIZE
+from .consts import CHUNK_SIZE, BUCKET_TYPE_HNS
 from .exceptions import TosClientError, make_server_error_with_exception
 from .models import CommonPrefixInfo, DeleteMarkerInfo
 from .utils import (get_etag, get_value, meta_header_decode,
@@ -38,6 +39,25 @@ class HeadBucketOutput(ResponseInfo):
         self.storage_class = get_value(self.header, "x-tos-storage-class", lambda x: convert_storage_class_type(x))
         self.az_redundancy = get_value(self.header, "x-tos-az-redundancy", lambda x: convert_az_redundancy_type(x))
         self.project_name = get_value(self.header, "x-tos-project-name")
+        self.bucket_type = get_value(self.header, "x-tos-bucket-type")
+
+
+class FileStatusOutput(ResponseInfo):
+    def __init__(self, key, bucket_type, resp):
+        super(FileStatusOutput, self).__init__(resp)
+        if bucket_type == BUCKET_TYPE_HNS:
+            self.key = key
+            self.size = get_value(resp.headers, 'Content-Length')
+            self.last_modified = get_value(resp.headers, 'Last-Modified')
+            self.crc64 = get_value(resp.headers, 'x-tos-hash-crc64ecma')
+            self.crc32 = get_value(resp.headers, 'x-tos-hash-crc32c')
+            return
+        data = json.loads(resp.read())
+        self.key = get_value(data, 'Key')
+        self.size = get_value(data, 'Size')
+        self.last_modified = get_value(data, 'LastModified')
+        self.crc32 = get_value(data, 'CRC32')
+        self.crc64 = get_value(data, 'CRC64')
 
 
 class DeleteBucketOutput(ResponseInfo):
@@ -626,6 +646,14 @@ class AppendObjectOutput(ResponseInfo):
         super(AppendObjectOutput, self).__init__(resp)
         self.version_id = get_value(resp.headers, "x-tos-version-id")
         self.next_append_offset = get_value(resp.headers, "x-tos-next-append-offset", lambda x: int(x))
+        self.hash_crc64_ecma = get_value(resp.headers, "x-tos-hash-crc64ecma", lambda x: int(x))
+
+
+class ModifyObjectOutput(AppendObjectOutput):
+    def __init__(self, resp):
+        super(ModifyObjectOutput, self).__init__(resp)
+        self.version_id = get_value(resp.headers, "x-tos-version-id")
+        self.next_modify_offset = get_value(resp.headers, "x-tos-next-modify-offset", lambda x: int(x))
         self.hash_crc64_ecma = get_value(resp.headers, "x-tos-hash-crc64ecma", lambda x: int(x))
 
 

@@ -4,6 +4,8 @@ import datetime
 import http
 import http.client as httplib
 import os
+import random
+import threading
 import time
 import unittest
 import urllib.parse
@@ -24,6 +26,7 @@ from tos.enum import (ACLType, AzRedundancyType, DataTransferType,
 from tos.exceptions import TosClientError, TosServerError
 from tos.models2 import Deleted, Grant, Grantee, ListObjectsOutput, Owner, ObjectTobeDeleted, Tag, \
     PostSignatureCondition, UploadedPart, PolicySignatureCondition, RestoreJobParameters, GenericInput
+from tos.safe_map import SafeMapFIFO
 from tos.utils import RateLimiter, meta_header_encode, meta_header_decode
 
 
@@ -1624,6 +1627,49 @@ class TestObject(TosTestBase):
         self.assertEqual(out_meta['age'], meta['age'])
         self.assertEqual(out_meta['special'], meta['special'])
         self.assertEqual(out_meta[raw], meta[raw])
+
+    def test_syncMap(self):
+        m1 = SafeMapFIFO(max_length=3, default_expiration_sec=5, sync_delete=False)
+        m1.put("bucket1", "hns")
+        m1.put("bucket2", "hns")
+        m1.put("bucket3", "hns")
+        m1.put("bucket4", "hns")
+        v1 = m1.get("bucket1")
+        assert v1 == None
+
+        time.sleep(5)
+        v2 = m1.get("bucket2")
+        assert v2 == None
+        v3 = m1.get("bucket3")
+        assert v3 == None
+        v4 = m1.get("bucket4")
+        assert v4 == None
+
+        m1 = SafeMapFIFO(max_length=100, default_expiration_sec=5, sync_delete=False)
+        def put_items():
+            for i in range(1000):
+                key = f"key_{i}"
+                val = str(i)
+                m1.put(key, val)
+                print("put {}:{}".format(key, val))
+
+        def get_items():
+            for _ in range(1000):
+                key = f"key_{random.randint(0, 1000)}"  # 随机获取一个已插入的键
+                value = m1.get(key)
+                print("get {}:{}".format(key, value))
+        put_thread1 = threading.Thread(target=put_items)
+        put_thread2 = threading.Thread(target=put_items)
+        put_thread3 = threading.Thread(target=put_items)
+        get_thread1 = threading.Thread(target=get_items)
+        get_thread2 = threading.Thread(target=get_items)
+        get_thread3 = threading.Thread(target=get_items)
+        put_thread1.start()
+        get_thread1.start()
+        put_thread2.start()
+        get_thread2.start()
+        put_thread3.start()
+        get_thread3.start()
 
     def wrapper_socket_io(self, init, crc, use_data_transfer_listener, ues_limiter, bucket_name):
         def progress(consumed_bytes, total_bytes, rw_once_bytes,
